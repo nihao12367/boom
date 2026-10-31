@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="referrer" content="no-referrer">
+<title>受保护的文字</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    min-height:100%;
+    display:flex;align-items:center;justify-content:center;
+    padding:clamp(12px,4vw,40px);
+    background:radial-gradient(1100px 560px at 50% -15%, #1a2331 0%, #0d1117 62%), #0d1117;
+    color:#e9eef5;
+    font-family:"Noto Serif SC","Source Han Serif SC","Songti SC",Georgia,"Microsoft YaHei",serif;
+    -webkit-user-select:none;user-select:none;
+    -webkit-touch-callout:none;
+    -webkit-tap-highlight-color:transparent;
+    overflow:hidden;
+  }
+  #stage{
+    position:relative;
+    width:min(880px,100%);
+    border:1px solid rgba(255,255,255,.09);
+    border-radius:16px;
+    overflow:hidden;
+    background:#0f1520;
+    box-shadow:
+      0 40px 90px -40px rgba(0,0,0,.95),
+      0 0 0 1px rgba(255,255,255,.02),
+      inset 0 1px 0 rgba(255,255,255,.06);
+  }
+  #cv{display:block;width:100%;height:auto;pointer-events:none;}
+  /* 透明遮罩：挡住 canvas 的右键 / 拖拽 / 长按菜单 */
+  .overlay{position:absolute;inset:0;z-index:3;background:transparent;cursor:default;}
+
+  #toast{
+    position:fixed;left:50%;bottom:36px;transform:translate(-50%,16px);
+    padding:10px 20px;border-radius:999px;
+    background:rgba(20,27,38,.92);
+    border:1px solid rgba(255,255,255,.12);
+    color:#cfe3ff;font-size:13px;letter-spacing:.4px;white-space:nowrap;
+    opacity:0;pointer-events:none;transition:.28s ease;z-index:99;
+    backdrop-filter:blur(8px);
+    font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;
+  }
+  #toast.show{opacity:1;transform:translate(-50%,0);}
+
+  #blackout{
+    position:fixed;inset:0;z-index:999;display:none;
+    align-items:center;justify-content:center;text-align:center;
+    background:#0b0f15;padding:24px;
+    font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;
+  }
+  #blackout.show{display:flex;}
+  #blackout .icon{font-size:34px;margin-bottom:16px;opacity:.85;}
+  #blackout h2{font-size:17px;font-weight:600;letter-spacing:.5px;margin-bottom:8px;}
+  #blackout p{font-size:13px;color:#7c8899;line-height:1.9;}
+
+  /* 打印保护 */
+  @media print{
+    body{display:none !important;}
+    html::after{
+      content:"⚠ 本文内容禁止打印 / 复制";
+      display:flex;align-items:center;justify-content:center;
+      height:100vh;font-size:18px;color:#999;
+      font-family:system-ui,sans-serif;
+    }
+  }
+</style>
+</head>
+<body>
+
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div class="overlay"></div>
+  </div>
+
+  <div id="toast"></div>
+
+  <div id="blackout">
+    <div>
+      <div class="icon">🔒</div>
+      <h2>检测到开发者工具已打开</h2>
+      <p>为保护内容，页面显示已暂停。<br>请关闭开发者工具后刷新页面。</p>
+    </div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* =========================================================
+     1. 要保护的文字（换成你自己的内容即可）
+     ========================================================= */
+  const TEXT =
+    '【受保护的文字 · 示例】\n' +
+    '这段文字并不存在于页面的 DOM 之中。它由脚本在运行时解码，并直接绘制到 Canvas 画布上，' +
+    '因此浏览器的“查看源代码”“全选复制”“另存为文本”都取不到它的内容。\n' +
+    '页面同时拦截了右键菜单、复制、剪切、拖拽、选择、打印，以及 F12、Ctrl+U、Ctrl+S、' +
+    'Ctrl+Shift+I 等常见快捷键，并会在检测到开发者工具时暂停显示。\n' +
+    '需要坦诚说明的是：任何在浏览器里显示出来的内容，最终都必须被渲染，' +
+    '所以前端防护只能提高获取成本，无法做到绝对安全。真正需要保密的信息，请放在服务端。';
+
+  /* =========================================================
+     2. 元素引用与配置
+     ========================================================= */
+  const stage    = document.getElementById('stage');
+  const canvas   = document.getElementById('cv');
+  const toastEl  = document.getElementById('toast');
+  const blackout = document.getElementById('blackout');
+
+  const FONT_FAMILY =
+    '"Noto Serif SC","Source Han Serif SC","Songti SC",Georgia,"Microsoft YaHei",serif';
+
+  const measureCtx = document.createElement('canvas').getContext('2d');
+
+  /* =========================================================
+     3. 文本自动换行（按字符测量，中英文都适用）
+     ========================================================= */
+  function wrapText(text, font, maxWidth) {
+    measureCtx.font = font;
+    const lines = [];
+    text.split('\n').forEach(function (para) {
+      if (!para) { lines.push(''); return; }
+      let line = '';
+      for (const ch of para) {
+        if (line && measureCtx.measureText(line + ch).width > maxWidth) {
+          lines.push(line);
+          line = ch;
+        } else {
+          line += ch;
+        }
+      }
+      if (line) lines.push(line);
+    });
+    return lines;
+  }
+
+  /* =========================================================
+     4. 绘制到 Canvas —— 文字不进入 DOM
+     ========================================================= */
+  function render() {
+    const cssW  = Math.max(280, stage.clientWidth);
+    const dpr   = Math.min(window.devicePixelRatio || 1, 2);
+    const narrow = cssW < 520;
+
+    const padX      = narrow ? 22 : 42;
+    const padY      = narrow ? 28 : 46;
+    const fontSize  = narrow ? 15 : 17;
+    const lineHeight = Math.round(fontSize * 1.95);
+    const font      = fontSize + 'px ' + FONT_FAMILY;
+
+    const maxWidth = cssW - padX * 2;
+    const lines    = wrapText(TEXT, font, maxWidth);
+    const cssH     = Math.round(padY * 2 + lines.length * lineHeight);
+
+    // 设置真实分辨率（乘以 DPR 保证高分屏清晰）
+    canvas.width  = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    canvas.style.height = cssH + 'px';
+
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    // 背景
+    const bg = ctx.createLinearGradient(0, 0, 0, cssH);
+    bg.addColorStop(0, '#111a26');
+    bg.addColorStop(1, '#0b1017');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    // 顶部装饰细线
+    const lineGrad = ctx.createLinearGradient(padX, 0, cssW - padX, 0);
+    lineGrad.addColorStop(0,   'rgba(94,234,212,0)');
+    lineGrad.addColorStop(0.5, 'rgba(94,234,212,.55)');
+    lineGrad.addColorStop(1,   'rgba(94,234,212,0)');
+    ctx.fillStyle = lineGrad;
+    ctx.fillRect(padX, Math.round(padY / 2), maxWidth, 1);
+
+    // 正文
+    ctx.font = font;
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#e6edf6';
+    lines.forEach(function (line, i) {
+      ctx.fillText(line, padX, padY + i * lineHeight + lineHeight / 2);
+    });
+  }
+
+  /* =========================================================
+     5. 尺寸变化 / 字体加载完成后重绘
+     ========================================================= */
+  let resizeTimer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(render, 120);
+  }, { passive: true });
+
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(render);
+  }
+
+  /* =========================================================
+     6. 轻提示
+     ========================================================= */
+  let toastTimer = null;
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      toastEl.classList.remove('show');
+    }, 1600);
+  }
+
+  /* =========================================================
+     7. 事件拦截
+     ========================================================= */
+  const stop = function (e) { e.preventDefault(); e.stopPropagation(); return false; };
+
+  // 右键菜单
+  document.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    toast('右键菜单已被禁用');
+  }, true);
+
+  // 复制 / 剪切 / 选择 / 拖拽
+  document.addEventListener('copy',  stop, true);
+  document.addEventListener('cut',   stop, true);
+  document.addEventListener('selectstart', stop, true);
+  document.addEventListener('dragstart',   stop, true);
+
+  // 快捷键
+  document.addEventListener('keydown', function (e) {
+    const k = (e.key || '').toLowerCase();
+    const mod = e.ctrlKey || e.metaKey;
+
+    const blocked =
+      e.key === 'F12' ||
+      (mod && e.shiftKey && ['i', 'j', 'c', 'k'].includes(k)) ||  // 开发者工具
+      (mod && ['u', 's', 'p', 'a', 'c', 'x'].includes(k)) ||      // 源码/保存/打印/全选/复制/剪切
+      (e.metaKey && e.altKey && ['i', 'j', 'c', 'u'].includes(k)); // macOS
+
+    if (blocked) {
+      e.preventDefault();
+      e.stopPropagation();
+      toast('该操作已被保护机制拦截');
+    }
+  }, true);
+
+  /* =========================================================
+     8. 开发者工具检测（尺寸差启发式，可按需删除）
+     ========================================================= */
+  let devOpen = false;
+  function checkDevtools() {
+    const wGap = window.outerWidth  - window.innerWidth;
+    const hGap = window.outerHeight - window.innerHeight;
+    const open = wGap > 200 || hGap > 200;
+    if (open !== devOpen) {
+      devOpen = open;
+      blackout.classList.toggle('show', open);
+    }
+  }
+  setInterval(checkDevtools, 900);
+
+  /* =========================================================
+     9. 启动
+     ========================================================= */
+  render();
+
+  // 供调试用：在控制台可调用 __encode 生成混淆文本（仅作提示，非必需）
+  window.__encode = function (str) {
+    return Array.from(str)
+      .map(function (c) { return (c.codePointAt(0) ^ 0x5A5A).toString(36); })
+      .join('.');
+  };
+
+})();
+</script>
+</body>
+</html>
